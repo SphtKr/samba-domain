@@ -10,15 +10,23 @@ appSetup () {
 	JOIN=${JOIN:-false}
 	JOINSITE=${JOINSITE:-NONE}
 	MULTISITE=${MULTISITE:-false}
+	IDLOWER=${IDLOWER:-3000000}
+	IDUPPER=${IDUPPER:-4000000}
 	NOCOMPLEXITY=${NOCOMPLEXITY:-false}
 	INSECURELDAP=${INSECURELDAP:-false}
+	ACLSTORAGE=${ACLSTORAGE:-DEFAULT}
 	DNSFORWARDER=${DNSFORWARDER:-NONE}
+	DNSBACKEND=${DNSBACKEND:-SAMBA_INTERNAL}
 	HOSTIP=${HOSTIP:-NONE}
-	DOMAIN_DC=${DOMAIN_DC:-${DOMAIN_DC}}
-	
+	DOMAIN_DN=${DOMAIN_DN:-${DOMAIN_DC:-DC=$(echo $DOMAIN | sed -e 's/\./,DC=/g')}}
 	LDOMAIN=${DOMAIN,,}
 	UDOMAIN=${DOMAIN^^}
 	URDOMAIN=${UDOMAIN%%.*}
+	BINDINTERFACES=${BINDINTERFACES:-${HOSTIP} lo} # specify "false" to add no settings!
+
+	# validate/clean input for some options
+	if [[ $DNSBACKEND != "SAMBA_INTERNAL" ]]; then DNSBACKEND="BIND9_DLZ"; fi
+	#TODO: Validate $ACLSTORAGE value
 
 	# If multi-site, we need to connect to the VPN before joining the domain
 	if [[ ${MULTISITE,,} == "true" ]]; then
@@ -35,6 +43,37 @@ appSetup () {
 		HOSTIP_OPTION=""
 	fi
 
+	# Set xattr options
+	if [[ "${ACLSTORAGE}" != "DEFAULT" ]]; then
+		# --use-xattrs removed in 4.9!
+		#ACLSTORAGE_OPTIONS=(--option="vfs objects = acl_xattr xattr_tdb" --use-xattrs=no) 
+		# https://github.com/lxc/lxc/issues/2708#issuecomment-1865674625
+		ACLSTORAGE_OPTIONS=(
+			--option="vfs objects = dfs_samba4 acl_xattr xattr_tdb"
+			--option="acl_xattr:security_acl_name = user.NTACL"
+		)
+		#TODO: Add nfs4acl_xattr as another option?
+		# https://lists.samba.org/archive/samba/2021-February/234326.html
+		#ACLSTORAGE_OPTIONS=(
+		#	--option="vfs objects = dfs_samba4 posixacl nfs4acl_xattr acl_xattr"
+		#	--option="nfs4acl_xattr:encoding = nfs"
+		#	--option="nfs4acl_xattr:default acl style = windows"
+		#	--option="nfs4acl_xattr:xattr_name = user.nfs4_acl"
+		#)
+	else
+		ACLSTORAGE_OPTIONS=()
+	fi
+
+	# Set interfaces options
+	if [[ "${BINDINTERFACES}" != "false" ]]; then
+		BINDINTERFACES_OPTIONS=(
+			--option="bind interfaces only = yes"
+			--option="interfaces = ${BINDINTERFACES}"
+		)
+	else
+		BINDINTERFACES_OPTIONS=()
+	fi
+
 	# Set up samba
 	mv /etc/krb5.conf /etc/krb5.conf.orig
 	echo "[libdefaults]" > /etc/krb5.conf
@@ -48,12 +87,42 @@ appSetup () {
 		mv /etc/samba/smb.conf /etc/samba/smb.conf.orig
 		if [[ ${JOIN,,} == "true" ]]; then
 			if [[ ${JOINSITE} == "NONE" ]]; then
-				samba-tool domain join ${LDOMAIN} DC -U"${URDOMAIN}\administrator" --password="${DOMAINPASS}" --dns-backend=SAMBA_INTERNAL
+				samba-tool domain join ${LDOMAIN} DC -U"${URDOMAIN}\administrator" --password="${DOMAINPASS}" \
+				--option="wins support = yes" \
+				--option="template shell = /bin/bash" \
+				--option="template homedir = /home/%U" \
+				--option="idmap config * : range = ${IDLOWER}-${IDUPPER}" \
+				"${ACLSTORAGE_OPTIONS[@]}" "${BINDINTERFACES_OPTIONS[@]}" \
+				--dns-backend=${DNSBACKEND}
 			else
-				samba-tool domain join ${LDOMAIN} DC -U"${URDOMAIN}\administrator" --password="${DOMAINPASS}" --dns-backend=SAMBA_INTERNAL --site=${JOINSITE}
+				samba-tool domain join ${LDOMAIN} DC -U"${URDOMAIN}\administrator" --password="${DOMAINPASS}" \
+				--option="wins support = yes" \
+				--option="template shell = /bin/bash" \
+				--option="template homedir = /home/%U" \
+				--option="idmap config * : range = ${IDLOWER}-${IDUPPER}" \
+				"${ACLSTORAGE_OPTIONS[@]}" "${BINDINTERFACES_OPTIONS[@]}" \
+				--dns-backend=${DNSBACKEND} \
+				--site=${JOINSITE}
 			fi
 		else
-			samba-tool domain provision --use-rfc2307 --domain=${URDOMAIN} --realm=${UDOMAIN} --server-role=dc --dns-backend=SAMBA_INTERNAL --adminpass=${DOMAINPASS} ${HOSTIP_OPTION}
+			# https://github.com/lxc/lxc/issues/2708#issuecomment-473466062 ... -544 is BUILTIN\Administrators
+			printf '%s\n' \
+				"dn: CN=S-1-5-32-544"\
+				"cn: S-1-5-32-544"\
+				"objectClass: sidMap"\
+				"objectSid: S-1-5-32-544"\
+				"type: ID_TYPE_BOTH"\
+				"xidNumber: ${IDLOWER}"\
+				"distinguishedName: CN=S-1-5-32-544" >>  /usr/share/samba/setup/idmap_init.ldif
+			sed -i "s/3000000/${IDLOWER}/g" /usr/share/samba/setup/idmap_init.ldif
+			sed -i "s/4000000/${IDUPPER}/g" /usr/share/samba/setup/idmap_init.ldif
+			samba-tool domain provision --use-rfc2307 --domain=${URDOMAIN} --realm=${UDOMAIN} --server-role=dc \
+				--option="wins support = yes" \
+				--option="template shell = /bin/bash" \
+				--option="template homedir = /home/%U" \
+				--option="idmap config * : range = ${IDLOWER}-${IDUPPER}" \
+				"${ACLSTORAGE_OPTIONS[@]}" "${BINDINTERFACES_OPTIONS[@]}" \
+				--dns-backend=${DNSBACKEND} --adminpass=${DOMAINPASS} ${HOSTIP_OPTION}
 			if [[ ${NOCOMPLEXITY,,} == "true" ]]; then
 				samba-tool domain passwordsettings set --complexity=off
 				samba-tool domain passwordsettings set --history-length=0
@@ -61,15 +130,17 @@ appSetup () {
 				samba-tool domain passwordsettings set --max-pwd-age=0
 			fi
 		fi
-		sed -i "/\[global\]/a \
-			\\\tidmap_ldb:use rfc2307 = yes\\n\
-			wins support = yes\\n\
-			template shell = /bin/bash\\n\
-			template homedir = /home/%U\\n\
-			idmap config ${URDOMAIN} : schema_mode = rfc2307\\n\
-			idmap config ${URDOMAIN} : unix_nss_info = yes\\n\
-			idmap config ${URDOMAIN} : backend = ad\
-			" /etc/samba/smb.conf
+		# moved to options above
+		#sed -i "/\[global\]/a \
+		#	\\\twins support = yes\\n\
+		#	template shell = /bin/bash\\n\
+		#	template homedir = /home/%U\\n\
+		#	" /etc/samba/smb.conf
+			#idmap_ldb:use rfc2307 = yes\\n\
+			#idmap config ${URDOMAIN} : schema_mode = rfc2307\\n\
+			#idmap config ${URDOMAIN} : unix_nss_info = yes\\n\
+			#idmap config ${URDOMAIN} : backend = ad\
+
 		sed -i "s/LOCALDC/${URDOMAIN}DC/g" /etc/samba/smb.conf
 		if [[ $DNSFORWARDER != "NONE" ]]; then
 			sed -i "/\[global\]/a \
@@ -103,6 +174,11 @@ appSetup () {
 		echo "[program:openvpn]" >> /etc/supervisor/conf.d/supervisord.conf
 		echo "command=/usr/sbin/openvpn --config /docker.ovpn" >> /etc/supervisor/conf.d/supervisord.conf
 	fi
+	if [[ ${DNSBACKEND} != "SAMBA_INTERNAL" ]]; then #TODO: make startup optional, e.g. for multi-container pod deployment?
+		echo "" >> /etc/supervisor/conf.d/supervisord.conf
+		echo "[program:named]" >> /etc/supervisor/conf.d/supervisord.conf
+		echo "command=/usr/sbin/named -g -u bind" >> /etc/supervisor/conf.d/supervisord.conf
+	fi
 
 	echo "server 127.127.1.0" > /etc/ntpd.conf
 	echo "fudge  127.127.1.0 stratum 10" >> /etc/ntpd.conf
@@ -125,16 +201,16 @@ appSetup () {
 fixDomainUsersGroup () {
 	GIDNUMBER=$(ldbedit -H /var/lib/samba/private/sam.ldb -e cat "samaccountname=domain users" | { grep ^gidNumber: || true; })
 	if [ -z "${GIDNUMBER}" ]; then
-		echo "dn: CN=Domain Users,CN=Users,${DOMAIN_DC}
+		echo "dn: CN=Domain Users,CN=Users,${DOMAIN_DN}
 changetype: modify
 add: gidNumber
-gidNumber: 3000000" | ldbmodify -H /var/lib/samba/private/sam.ldb
+gidNumber: $((IDLOWER + 1))" | ldbmodify -H /var/lib/samba/private/sam.ldb
 		net cache flush
 	fi
 }
 
 setupSSH () {
-	echo "dn: CN=sshPublicKey,CN=Schema,CN=Configuration,${DOMAIN_DC}
+	echo "dn: CN=sshPublicKey,CN=Schema,CN=Configuration,${DOMAIN_DN}
 changetype: add
 objectClass: top
 objectClass: attributeSchema
@@ -146,10 +222,10 @@ description: MANDATORY: OpenSSH Public key
 attributeSyntax: 2.5.5.10
 oMSyntax: 4
 isSingleValued: FALSE
-objectCategory: CN=Attribute-Schema,CN=Schema,CN=Configuration,${DOMAIN_DC}
+objectCategory: CN=Attribute-Schema,CN=Schema,CN=Configuration,${DOMAIN_DN}
 searchFlags: 8
 schemaIDGUID:: cjDAZyEXzU+/akI0EGDW+g==" > /tmp/Sshpubkey.attr.ldif
-	echo "dn: CN=ldapPublicKey,CN=Schema,CN=Configuration,${DOMAIN_DC}
+	echo "dn: CN=ldapPublicKey,CN=Schema,CN=Configuration,${DOMAIN_DN}
 changetype: add
 objectClass: top
 objectClass: classSchema
@@ -160,18 +236,18 @@ description: MANDATORY: OpenSSH LPK objectclass
 lDAPDisplayName: ldapPublicKey
 subClassOf: top
 objectClassCategory: 3
-objectCategory: CN=Class-Schema,CN=Schema,CN=Configuration,${DOMAIN_DC}
-defaultObjectCategory: CN=ldapPublicKey,CN=Schema,CN=Configuration,${DOMAIN_DC}
+objectCategory: CN=Class-Schema,CN=Schema,CN=Configuration,${DOMAIN_DN}
+defaultObjectCategory: CN=ldapPublicKey,CN=Schema,CN=Configuration,${DOMAIN_DN}
 mayContain: sshPublicKey
 schemaIDGUID:: +8nFQ43rpkWTOgbCCcSkqA==" > /tmp/Sshpubkey.class.ldif
-	ldbadd -H /var/lib/samba/private/sam.ldb /var/lib/samba/private/sam.ldb /tmp/Sshpubkey.attr.ldif --option="dsdb:schema update allowed"=true
-	ldbadd -H /var/lib/samba/private/sam.ldb /var/lib/samba/private/sam.ldb /tmp/Sshpubkey.class.ldif --option="dsdb:schema update allowed"=true
+	ldbadd -H /var/lib/samba/private/sam.ldb --option="dsdb:schema update allowed"=true /tmp/Sshpubkey.attr.ldif
+	ldbadd -H /var/lib/samba/private/sam.ldb --option="dsdb:schema update allowed"=true /tmp/Sshpubkey.class.ldif
 }
 
 appStart () {
 	/usr/bin/supervisord > /var/log/supervisor/supervisor.log 2>&1 &
 	if [ "${1}" = "true" ]; then
-		echo "Sleeping 10 before checking on Domain Users of gid 3000000 and setting up sshPublicKey"
+		echo "Sleeping 10 before checking on Domain Users of gid $((IDLOWER + 1)) and setting up sshPublicKey"
 		sleep 10
 		fixDomainUsersGroup
 		setupSSH

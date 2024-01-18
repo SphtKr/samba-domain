@@ -22,7 +22,8 @@ RUN \
         ldb-tools \
         vim \
         curl \
-        ntp &&\
+        ntp \
+        bind9 &&\
     apt-get clean autoclean &&\
     apt-get autoremove --yes &&\
     rm -rf /var/lib/{apt,dpkg,cache,log}/ &&\
